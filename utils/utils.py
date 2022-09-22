@@ -246,11 +246,14 @@ def non_max_suppression(prediction, conf_thres=0.3, iou_thres=0.45, classes=None
     multi_label = nc > 1  # multiple labels per box (adds 0.5ms/img)
 
     t = time.time()
+    wyh = prediction.shape[0]
+    wttt = [torch.zeros((0, 6), device="cpu")]
     output = [torch.zeros((0, 6), device="cpu")] * prediction.shape[0]
 
     for xi, x in enumerate(prediction):  # image index, image inference
         # Apply constraints
         # x[((x[..., 2:4] < min_wh) | (x[..., 2:4] > max_wh)).any(1), 4] = 0  # width-height
+
         x = x[x[..., 4] > conf_thres]  # confidence
 
         # If none remain process next image
@@ -286,7 +289,7 @@ def non_max_suppression(prediction, conf_thres=0.3, iou_thres=0.45, classes=None
         i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
         if i.shape[0] > max_det:  # limit detections
             i = i[:max_det]
-
+        print(i)
         output[xi] = x[i].detach().cpu()
 
         if (time.time() - t) > time_limit:
@@ -343,6 +346,7 @@ def handel_preds(preds, cfg, device):
             anchor_boxes[:, :, :, 4] = o[:, :, :, 0].sigmoid()
 
             #计算cls分数
+
             anchor_boxes[:, :, :, 5:] = F.softmax(c[:, :, :, :], dim = 3)
 
             #torch tensor 转为 numpy array
