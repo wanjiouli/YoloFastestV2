@@ -22,6 +22,104 @@ import torch
 import model.detector
 import utils.utils
 import numpy as np
+import torchvision
+
+def bbox_iou(box1,box2):
+    b1_x1, b1_y1, b1_x2, b1_y2 = box1[0],box1[1],box1[2],box1[3]
+    b2_x1, b2_y1, b2_x2, b2_y2 = box2[:,0],box2[:,1],box2[:,2],box2[:,3]
+
+    inter_rect_x1 = np.maximum(b1_x1,b2_x1)
+    inter_rect_y1 = np.maximum(b1_y1,b2_y1)
+    inter_rect_x2 = np.minimum(b1_x2,b2_x2)
+    inter_rect_y2 = np.minimum(b1_y2,b2_y2)
+
+    inter_area = np.maximum(inter_rect_x2 - inter_rect_x1,0) * np.maximum(inter_rect_y2 - inter_rect_y1,0)
+
+    area_b1 = (b1_x2 - b1_x1) * (b1_y2 - b1_y2)
+    area_b2 = (b2_x2 - b2_x1) * (b1_y2 - b2_y1)
+
+    iou = inter_area / np.maximum((area_b1 + area_b2 - inter_area), 1e-6)
+    return iou
+
+def non_max_suppression_1(boxes,sigma=0.5,conf_thres=0.5,nms_thres=0.4):
+    # boxes (n,anchor num,4+1+80)
+    bs = np.shape(boxes)[0]       # 提取batch_size
+    # 将框转换成左上角右下角的形式
+    shape_boxes = np.zeros_like(boxes[:,:,:4])
+    shape_boxes[:,:,0] = boxes[:,:,0] - boxes[:,:,2] / 2
+    shape_boxes[:,:,1] = boxes[:,:,1] - boxes[:,:,3] / 2
+    shape_boxes[:,:,2] = boxes[:,:,0] + boxes[:,:,2] / 2
+    shape_boxes[:,:,3] = boxes[:,:,1] + boxes[:,:,3] / 2
+
+    boxes[:,:,:4] = shape_boxes
+    output = []
+    # 按batch数量循环
+    for i in range(bs):
+        # 提取第i batch的预测结果
+        prediction = boxes[i]
+        # 提取预测的第5列的的数值,这个数值代表是否检测出物体
+        score = prediction[:,4]
+        # 过滤掉小于conf_thres设置的值的框框,这一步将极大的筛选掉框框的数量
+        mask = score > conf_thres
+        detections = prediction[mask]
+        # 提取预测的类别分数
+        w = np.max(detections[:, 5:], axis=-1)
+        class_conf = np.expand_dims(np.max(detections[:,5:],axis=-1),axis=-1)
+        # 提取预测的种类类别
+        class_pred = np.expand_dims(np.argmax(detections[:,5:],axis=-1),axis=-1)
+        # 将 detections[:,:5] xyxy n,class_conf 预测类别的概率,class_pred 预测的类别 按最后一维拼接 这里就是按列拼接
+        detections = np.concatenate([detections[:,:5],class_conf,class_pred],-1)
+        # 去除重复的类别
+        unique_class = np.unique(detections[:,-1])
+        if len(unique_class) == 0:
+            continue
+        # 用于过渡使用
+        best_box = []
+        # 按类别进行nms
+        for c in unique_class:
+            # 将不是当前正在循环的类别排除掉
+            cls_mask = detections[:,-1] == c
+            detection = detections[cls_mask]
+            # 提取是否物体的数值
+            scores = detection[:,4]
+            # 第一步是np.argsort 将按scores的值从小到大的返回index,后有让将index取反,按从从大到小排列 最后对detection进行排列
+            arg_sort = np.argsort(scores)[::-1]
+            detection = detection[arg_sort]
+
+            # 柔性非极大抑制
+            # while np.shape(detection)[0] > 0:
+            #     best_box.append(detection[0])
+            #     if len(detection) == 1:
+            #         break
+            #     # 计算每一次有物体分数最大的best_box与其他非最大的iou
+            #     ious = bbox_iou(best_box[-1],detection[1:])
+            #     # 计算IOU取高斯指数后乘上原得分
+            #     detection[1:,4] = np.exp(-(ious * ious) / sigma) * detection[1:,4]
+            #     # 提取除第一个数据后的数据
+            #     detection = detection[1:]
+            #     # 保留得分大于mns_thres 删除小于的mns_thres
+            #     detection = detection[detection[:, 4] >= conf_thres]
+            #     # 提取当前的score
+            #     scores = detection[:,4]
+            #     # 第一步是np.argsort 将按scores的值从小到大的返回index,后有让将index取反,按从从大到小排列 最后对detection进行排列 再次循环
+            #     arg_sort = np.argsort(scores)[::-1]
+            #     detection = detection[arg_sort]
+
+            # 普通非极大抑制
+            while len(detection) != 0:
+                # 将检测有物体分数最大的放入best_box中
+                best_box.append(detection[0])
+                # 如何detection 只有一个物体,就跳出循环
+                if len(detection) == 1:
+                    break
+                # 计算每一次有物体分数最大的best_box与其他非最大的iou
+                ious = bbox_iou(best_box[-1],detection[1:])
+                # 删除大于ious的框框,保留小于ious的框框
+                detection = detection[1:][ious < nms_thres]
+        output.append(best_box)
+
+    return output
+
 def box_area(boxes ):
     """
     :param boxes: [N, 4]
@@ -141,14 +239,12 @@ def non_max_suppression(prediction, conf_thres=0.3, iou_thres=0.45, classes=None
     #output = [torch.zeros((0, 6), device="cpu")] * prediction.shape[0]
     output = [np.zeros((0,6))] * prediction.shape[0]
     for xi, x in enumerate(prediction):  # image index, image inference
-        # Apply constraints
-        # x[((x[..., 2:4] < min_wh) | (x[..., 2:4] > max_wh)).any(1), 4] = 0  # width-height
         x = x[x[..., 4] > conf_thres]  # confidence
 
         # If none remain process next image
         if not x.shape[0]:
             continue
-        x[:,[0,1]] = x[:,[1,0]]
+        #x[:,[0,1]] = x[:,[1,0]]
 
         # Compute conf
         x[:, 5:] *= x[:, 4:5]  # conf = obj_conf * cls_conf
@@ -161,11 +257,6 @@ def non_max_suppression(prediction, conf_thres=0.3, iou_thres=0.45, classes=None
         conf = np.amax(x[:, 5:], axis=1,keepdims=True)
         j = np.argmax(x[:, 5:], axis=1,keepdims=True)
         x = np.concatenate((box,conf,j.astype('float32')),1)[conf.reshape(-1) > conf_thres]
-        #x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_thres]
-
-        # Filter by class
-        # if classes is not None:
-        #     x = x[(x[:, 5:6] == torch.tensor(classes, device=x.device)).any(1)]
 
         # Check shape
         n = x.shape[0]  # number of boxes
@@ -179,26 +270,27 @@ def non_max_suppression(prediction, conf_thres=0.3, iou_thres=0.45, classes=None
         c = x[:, 5:6] * max_wh  # classes
         # boxes (offset by class), scores
         boxes, scores = x[:, :4] + c, x[:, 4]
-        #i = numpy_nms(box,scores,iou_thres)
-        #i = np.array(nms(box, scores=scores, threshold=iou_thres))
+
+        # i = numpy_nms(box,scores,iou_thres)
+        # i = np.array(nms(box, scores=scores, threshold=iou_thres))
 
         print('*******************')
 
-        i = cv2.dnn.NMSBoxes(boxes.tolist(),scores, 0.3, 0.99)
-        i = i.reshape(-1)
-        print(i,type(i))
+        # i = cv2.dnn.NMSBoxes(boxes.tolist(),scores, 0.3,0.4)
+        # i = i.reshape(-1)
+        # print(i,type(i))
         print('***************************')
-        #i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
+        boxes = torch.from_numpy(boxes)
+        scores = torch.from_numpy(scores)
+        i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
         if i.shape[0] > max_det:  # limit detections
             i = i[:max_det]
         output[xi] = x[i]
         #output[xi] = x[i].detach().cpu()
-
+        print(i)
         if (time.time() - t) > time_limit:
             print(f'WARNING: NMS time limit {time_limit}s exceeded')
             break  # time limit exceeded
-        # output[xi] = x
-
     return output
 
 def softmax(x):
@@ -216,83 +308,82 @@ def sigmoid(x):
 #     return tensor.detach().cpu().numpy() if tensor.requires_grad else tensor.cpu().numpy()
 
 def make_grid(h, w, cfg):
-    hv,wv = np.meshgrid(np.arange(h),np.arange(w))
+    xs,ys = np.meshgrid(np.arange(h),np.arange(w)) # np.meshgrid(),返回X的坐标与Y的坐标
 
-    #hv, wv = torch.meshgrid([torch.arange(h), torch.arange(w)])
+    return (np.tile(np.stack([xs,ys], axis=2), (1, 1, 3))).reshape(h, w, cfg["anchor_num"], -1) # xs与ys在第三维上堆叠,形成对应的坐标点,后在第三维进行扩展3次，最好进行reshape为(22,22,3,2)
 
-    return (np.tile(np.stack([wv,hv],axis=2),(1,1,3))).reshape(h,w,cfg["anchor_num"],-1)
-    # torch.stack((wv, hv), 2).repeat(1,1,3).reshape(h, w, cfg["anchor_num"], -1).to(device)
 def handel_preds(preds, cfg):
-    # 加载anchor配置
+    # 加载先验框大小配置 [12.64, 19.39, 37.88, 51.48, 55.71, 138.31, 126.91, 78.23, 131.57, 214.55, 279.92, 258.87]
     anchors = np.array(cfg["anchors"])
-    #anchors = torch.from_numpy(anchors.reshape(len(preds) // 3, cfg["anchor_num"], 2)).to(device)
+
+    # 将先验框按顺序分为 (2, 3, 2)维度
     anchors = anchors.reshape(len(preds) // 3, cfg["anchor_num"], 2)
 
+    # 用来存检测出来的目标框
     output_bboxes = []
-    layer_index = [0, 0, 0, 1, 1, 1]
 
+    # 按特征层的数量进行循环特征后处理。这里只叙述第一次循环,后一次循环是一样的操作
     for i in range(len(preds) // 3):
+        # 用于中间过度时,存检测出来的目标框
         bacth_bboxes = []
 
+        # 提取第一层预测目标区域(batch,12,22,22)
         reg_preds = preds[i * 3]
+        # 提取第一层预测目标的置信度(batch,3,22,22)
         obj_preds = preds[(i * 3) + 1]
+        # 提取第一层预测目标的类别(batch,80,22,22)
         cls_preds = preds[(i * 3) + 2]
-        # reg_preds = torch.from_numpy(preds[i * 3])
-        # obj_preds = torch.from_numpy(preds[(i * 3) + 1])
-        # cls_preds = torch.from_numpy(preds[(i * 3) + 2])
-        for r, o, c in zip(reg_preds, obj_preds, cls_preds):
+
+        # 将第一层的 预测目标区域,置信度,类别 进行特征后处理
+        for r, o, c in zip(reg_preds, obj_preds, cls_preds): # 这里有个降维的效果
+            # 调整预测区域的的维度顺序,从(12,22,22) -> (22,22,12)
             r = r.transpose(1, 2, 0)
-            #r = r.permute(1, 2, 0)
+            # 将预测区域的三维reshape为(22,22,3,4)
             r = r.reshape(r.shape[0], r.shape[1], cfg["anchor_num"], -1)
 
+            # 调整置信度维度顺序 从(3,22,22) -> (22,22,3)
             o = o.transpose(1, 2, 0)
-            #o = o.permute(1, 2, 0)
+            # reshape为(22,22,3,1)
             o = o.reshape(o.shape[0], o.shape[1], cfg["anchor_num"], -1)
 
-            #c = c.permute(1, 2, 0)
+            # 调整类别维度顺序 从(80,22,22) -> (22,22,80)
             c = c.transpose(1, 2, 0)
+            # reshape为(22,22,1,80)
             c = c.reshape(c.shape[0], c.shape[1], 1, c.shape[2])
+            # (22,22,3,80) 扩展第三维度的数据为原来的3次
             c = np.tile(c,(1,1,3,1))
-            #c = c.repeat(1, 1, 3, 1)
+
+            # 设置一个维度为(22,22,3,85) 零矩阵 用于后续存储cx cy w h obj分数 cls分数
             anchor_boxes = np.zeros([r.shape[0], r.shape[1], r.shape[2], r.shape[3] + c.shape[3] + 1])
-            #anchor_boxes = torch.zeros(r.shape[0], r.shape[1], r.shape[2], r.shape[3] + c.shape[3] + 1)
 
             # 计算anchor box的cx, cy
+            # 获取(22,22,3,2)的网格坐标
             grid = make_grid(r.shape[0], r.shape[1], cfg)
+            # 获取倍率因子
             stride = cfg["height"] / r.shape[0]
+            # 将预测的目标区域的cx,cy偏移量经过sigmoid处理,再乘2,减去0.5 加上对应网格的坐标,追后乘上倍率因子,得到预测目标原图的中心坐标cx,cy
             anchor_boxes[:, :, :, :2] = ((sigmoid(r[:, :, :, :2]) * 2. - 0.5) + grid) * stride
-            #anchor_boxes[:, :, :, :2] = ((r[:, :, :, :2].sigmoid() * 2. - 0.5) + grid) * stride
 
             # 计算anchor box的w, h
+            # 读取anchors的宽高
             anchors_cfg = anchors[i]
+            # 计算每个anchor box 的宽高.每个点有3个anchor box,且这三个anchor box 的宽高是不同的
             anchor_boxes[:, :, :, 2:4] = (sigmoid(r[:, :, :, 2:4]) * 2) ** 2 * anchors_cfg  # wh
-            #anchor_boxes[:, :, :, 2:4] = (r[:, :, :, 2:4].sigmoid() * 2) ** 2 * anchors_cfg  # wh
 
-            # 计算obj分数
+            # 计算类别分数 是否有目标
             anchor_boxes[:, :, :, 4] = sigmoid(o[:, :, :, 0])
-            #anchor_boxes[:, :, :, 4] = o[:, :, :, 0].sigmoid()
 
-            # 计算cls分数
-
+            # 计算是哪一个类别的分数 softmax 对(22,22,3,80)第三维度进行计算
             anchor_boxes[:, :, :, 5:] = softmax(c[:, :, :, :])
-            #anchor_boxes[:, :, :, 5:] = F.softmax(c[:, :, :, :], dim=3)
 
-            # torch tensor 转为 numpy array
-            #anchor_boxes = anchor_boxes.cpu().detach().numpy()
             bacth_bboxes.append(anchor_boxes)
 
-            # n, anchor num, h, w, box => n, (anchor num*h*w), box
-        #bacth_bboxes = torch.from_numpy(np.array(bacth_bboxes))
         bacth_bboxes = np.array(bacth_bboxes)
-
+        # n, anchor num, h, w, box => n, (anchor num*h*w), box  (n,h,w,ahcnor num,box) => (n,anchor * h * w,box)
         bacth_bboxes = bacth_bboxes.reshape(bacth_bboxes.shape[0],-1,bacth_bboxes.shape[-1])
-        #bacth_bboxes = bacth_bboxes.view(bacth_bboxes.shape[0], -1, bacth_bboxes.shape[-1])
 
         output_bboxes.append(bacth_bboxes)
-
-        # merge
-
-    #output = torch.cat(output_bboxes, 1)
+    # concatenate 按第二维度合并
     output = np.concatenate(output_bboxes, 1)
     return output
 if __name__ == '__main__':
@@ -300,86 +391,90 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', type=str, default='',
                         help='Specify training profile *.data')
+
     # parser.add_argument('--weights', type=str, default='',
     #                     help='The path of the .pth model to be transformed')
+
     parser.add_argument('--img', type=str, default='',
                         help='The path of test image')
+    # load onnx形式的权重
     ort_session = onnxruntime.InferenceSession("./yolo-fastestv2.onnx")
+
+    # 解析传入的参数
     opt = parser.parse_args()
+
+    # 读取data参数
     cfg = utils.utils.load_datafile(opt.data)
-    #assert os.path.exists(opt.weights), "请指定正确的模型路径"
     assert os.path.exists(opt.img), "请指定正确的测试图像路径"
 
-    #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     # 数据预处理
+    # 读取被检测图像
     ori_img = cv2.imread(opt.img)
+    # 重置图片大小
     res_img = cv2.resize(ori_img, (cfg["width"], cfg["height"]), interpolation=cv2.INTER_LINEAR)
+    # 增加整图像维度数 并设置图像的像素值的类型
     img = res_img.reshape(1, cfg["height"], cfg["width"], 3).astype('float32')
-
-
-
+    # 调整图像的维度顺序并将图像的像素值转化为0-1之间
     img = (img.transpose(0,3,1,2) / 255.0)
 
-    #print(img.dtype)
-    # img = torch.from_numpy(img.transpose(0, 3, 1, 2))
-    #
-    # img = img.to(device).float() / 255.0
-
+    # 获取图像数据输入名称
     input_name = ort_session.get_inputs()
+    # 获取输出名称
     out_name_ = ort_session.get_outputs()
 
+    # 获取onnx的输出名称
     out_name = []
     for i in out_name_:
         out_name.append(i.name)
-    # print(out_name)
-    # print(img.shape)
-    #print({"input": img})
-    #print(to_numpy(img))
 
-    # print(img,type(img))
-    #print(img_1)
     start = time.perf_counter()
     preds = ort_session.run(out_name,{input_name[0].name:img})
     end = time.perf_counter()
-    # spend_time = (end - start) * 1000.
-    # print("forward time:%fms"%spend_time)
-    #print(preds)
-    #print({"input": img})
 
-    #print(type(preds))
-
-    #特征图后处理
+    # 特征图后处理 得出所有的检测出的目标框
     output = handel_preds(preds, cfg)
-    output_boxes = non_max_suppression(output, conf_thres = 0.3, iou_thres = 0.4)
 
-    # 加载label names
+    # 将所有检测出来目标框进行非极大值抑制进行去重
+    output_boxes = non_max_suppression_1(output, conf_thres = 0.3, nms_thres = 0.4)
+    # output_boxes = non_max_suppression(output, conf_thres = 0.3, iou_thres = 0.4)
+
+    # 加载标签名,并保存在LABEL_NAMES列表中
     LABEL_NAMES = []
+
     with open(cfg["names"], 'r') as f:
         for line in f.readlines():
             LABEL_NAMES.append(line.strip())
 
+
+    # 获取输入图像的原始高宽
     h, w, _ = ori_img.shape
+
+    # 获取高宽的倍率因子
     scale_h, scale_w = h / cfg["height"], w / cfg["width"]
-    # 绘制预测框
+
+    # 从列表中取出有效框 绘制预测框
     for box in output_boxes[0]:
+        # 将ndarray格式转化为列表格式
         box = box.tolist()
-
-        obj_score = box[4]
-        category = LABEL_NAMES[int(box[5])]
-
+        # 提取置信度分数
+        obj_score = box[5]
+        # 提取类别
+        category = LABEL_NAMES[int(box[6])]
+        # 计算目标框左上角点的坐标
         x1, y1 = int(box[0] * scale_w), int(box[1] * scale_h)
+        # 计算目标框右下角点的坐标
         x2, y2 = int(box[2] * scale_w), int(box[3] * scale_h)
-
-
+        # 在原图上画检测处的目标框
         cv2.rectangle(ori_img, (x1, y1), (x2, y2), (255, 255, 0), 2)
+        # 标记目标的置信度
         cv2.putText(ori_img, '%.2f' % obj_score, (x1, y1 - 5), 0, 0.7, (0, 255, 0), 2)
+        # 标记目标的类别
         cv2.putText(ori_img, category, (x1, y1 - 25), 0, 0.7, (0, 255, 0), 2)
-
-    cv2.imwrite("test_result.png", ori_img)
-    cv_img = cv2.imread('test_result.png')
-    cv2.imshow("cv_img", cv_img)
+    # 展示绘画后的图像
+    cv2.imshow('test_result.png', ori_img)
+    # 监听键盘
     cv2.waitKey(0)
-    cv2.destroyWindow()
-    spend_time = (end - start) * 1000.
-    print("total time:%fms"%spend_time)
+    # 保存图片
+    cv2.imwrite("test_result.png", ori_img)
+# 关闭所有窗口
+cv2.destroyAllWindows()
